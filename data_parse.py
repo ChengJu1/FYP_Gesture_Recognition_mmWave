@@ -1,382 +1,319 @@
+import os
+import asyncio
+import subprocess
 import pandas as pd
 import numpy as np
-import os
-import time
-import subprocess  # 替换 pyautogui
 import torch
-import asyncio
+import matplotlib.pyplot as plt
+from sklearn.cluster import DBSCAN
+
+# 引入自定义模块
 from pymmWave.utils import load_cfg_file
 from pymmWave.sensor import Sensor
 from pymmWave.IWR6843AOP import IWR6843AOP
-from asyncio import get_event_loop, sleep
 from model import GestureCNN
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import DBSCAN
-import matplotlib.pyplot as plt
 
-def run_apple_script(script):
-    """运行 AppleScript 命令"""
-    try:
-        result = subprocess.run(['osascript', '-e', script],
-                              capture_output=True,
-                              text=True)
-        if result.stderr:
-            print(f"错误: {result.stderr}")
-        return result.stdout.strip()
-    except Exception as e:
-        print(f"执行出错: {e}")
-        return None
+# ==========================================
+# 0. 全局配置项 (Configuration)
+# ==========================================
+class Config:
+    # 硬件端口配置 (根据实际环境修改)
+    CLI_PORT = '/dev/tty.SLAB_USBtoUART'
+    DATA_PORT = '/dev/tty.SLAB_USBtoUART4'
+    CFG_FILE_PATH = "./mmwave_config/xwr68xx_AOP_config_10FPS_maxRange_30cm.cfg"
+    
+    # 模型配置
+    MODEL_PATH = 'best_model.pth'
+    CONFIDENCE_THRESHOLD = 70.0  # 触发动作的置信度阈值
+    
+    # 数据采集配置
+    DATA_DIR = "./data/"
+    MIN_CAPTURE_SAMPLES = 500
+    SEQ_LENGTH = 3  # 推理所需的序列长度
 
-def get_system_volume():
-    """获取当前系统音量"""
-    script = 'output volume of (get volume settings)'
-    result = run_apple_script(script)
-    try:
-        return int(result) if result else 0
-    except:
-        return 0
 
-def control_media(action):
-    """控制媒体功能"""
-    try:
-        if action == "volumeup":
-            current_volume = get_system_volume()
-            new_volume = min(100, current_volume + 10)
-            script = f'set volume output volume {new_volume}'
-            run_apple_script(script)
-            after_volume = get_system_volume()
-            print(f"音量从 {current_volume} 增加到 {after_volume}")
+# ==========================================
+# 1. macOS 系统控制 (System Controller)
+# ==========================================
+class MacOSMediaController:
+    """封装对 MacOS 的系统级音频与媒体控制"""
+    
+    GESTURE_MAPPING = {
+        "Clockwise": "volumeup",
+        "Counter Clockwise": "volumedown",
+        "Swipe": "playpause",
+        "Swipe Up and Down": "mute"
+    }
 
-        elif action == "volumedown":
-            current_volume = get_system_volume()
-            new_volume = max(0, current_volume - 10)
-            script = f'set volume output volume {new_volume}'
-            run_apple_script(script)
-            after_volume = get_system_volume()
-            print(f"音量从 {current_volume} 减少到 {after_volume}")
+    @staticmethod
+    def _run_apple_script(script: str) -> str:
+        try:
+            result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+            if result.stderr:
+                print(f"[MacOS Error] {result.stderr.strip()}")
+            return result.stdout.strip()
+        except Exception as e:
+            print(f"[AppleScript Exec Error]: {e}")
+            return ""
 
-        elif action == "playpause":
-            script = '''
-            tell application "Music"
-                if player state is playing then
-                    pause
-                    return "已暂停"
+    @classmethod
+    def get_volume(cls) -> int:
+        res = cls._run_apple_script('output volume of (get volume settings)')
+        return int(res) if res.isdigit() else 0
+
+    @classmethod
+    def execute_action(cls, gesture_name: str) -> bool:
+        action = cls.GESTURE_MAPPING.get(gesture_name)
+        if not action:
+            return False
+
+        try:
+            if action == "volumeup":
+                new_vol = min(100, cls.get_volume() + 10)
+                cls._run_apple_script(f'set volume output volume {new_vol}')
+                print(f"🔊 音量调高至: {new_vol}%")
+                
+            elif action == "volumedown":
+                new_vol = max(0, cls.get_volume() - 10)
+                cls._run_apple_script(f'set volume output volume {new_vol}')
+                print(f"🔉 音量调低至: {new_vol}%")
+                
+            elif action == "playpause":
+                script = '''
+                tell application "Music"
+                    if player state is playing then
+                        pause
+                        return "Paused"
+                    else
+                        play
+                        return "Playing"
+                    end if
+                end tell
+                '''
+                status = cls._run_apple_script(script)
+                print(f"🎵 音乐状态: {status}")
+                
+            elif action == "mute":
+                script = '''
+                if output muted of (get volume settings) then
+                    set volume without output muted
+                    return "Unmuted"
                 else
-                    play
-                    return "开始播放"
+                    set volume with output muted
+                    return "Muted"
                 end if
-            end tell
-            '''
-            result = run_apple_script(script)
-            print(f"音乐播放状态: {result}")
+                '''
+                status = cls._run_apple_script(script)
+                print(f"🔇 扬声器: {status}")
+            return True
+        except Exception as e:
+            print(f"媒体控制异常: {e}")
+            return False
 
-        elif action == "mute":
-            script = '''
-            if output muted of (get volume settings) then
-                set volume without output muted
-                return "已取消静音"
-            else
-                set volume with output muted
-                return "已静音"
-            end if
-            '''
-            result = run_apple_script(script)
-            print(result)
 
-        return True
-
+# ==========================================
+# 2. 核心数据管线与推理引擎
+# ==========================================
+def load_inference_model(device: torch.device) -> torch.nn.Module:
+    """加载 PyTorch 推理模型"""
+    print(f"[*] 正在加载模型 (Device: {device})...")
+    model = GestureCNN()
+    try:
+        checkpoint = torch.load(Config.MODEL_PATH, map_location=device, weights_only=False)
+        if isinstance(checkpoint, GestureCNN):
+            model.load_state_dict(checkpoint.state_dict())
+        else:
+            model.load_state_dict(checkpoint)
+        model.to(device)
+        model.eval()
+        print("[+] 模型加载成功。")
+        return model
     except Exception as e:
-        print(f"执行 {action} 时出错: {e}")
-        return False
+        print(f"[-] 模型加载失败: {e}")
+        exit(1)
 
-# 手势映射
-gesture_to_action = {
-    "Clockwise": "volumeup",        # 音量增加
-    "Counter Clockwise": "volumedown",  # 音量减少
-    "Swipe": "playpause",           # 播放/暂停
-    "Swipe Up and Down": "mute"     # 静音
-}
-
-plt.ion()
-print(torch.__version__)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = GestureCNN()  # 首先创建模型实例
-checkpoint = torch.load('best_model.pth', map_location=device, weights_only=False)
-if isinstance(checkpoint, GestureCNN):
-    # 如果保存的是整个模型，获取其状态字典
-    model.load_state_dict(checkpoint.state_dict())
-else:
-    # 如果是状态字典则直接加载
-    model.load_state_dict(checkpoint)
-model.to(device)
-model.eval()
-
-def apply_dbscan_filtering(data, eps, min_samples):
+def apply_dbscan_filtering(data: np.ndarray, eps: float = 0.09, min_samples: int = 2) -> np.ndarray:
+    """雷达点云 DBSCAN 去噪"""
     if data is None or len(data) < min_samples:
-        print("Too few data points, returning original data")
-        return data
-
-    print("\n=== DBSCAN Clustering Analysis ===")
-    print(f"Input data points: {len(data)}")
-
-    # Directly use original spatial coordinates for clustering
-    spatial_data = data[:, :3]  # Only use x, y, z coordinates
-
-    # Apply DBSCAN without standardization
-    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-    clusters = dbscan.fit_predict(spatial_data)
-
-    print("Clustering results:", clusters)
-
-    # If all points are marked as noise (-1), return empty array
-    if np.all(clusters == -1):
-        print("All points identified as noise")
         return np.array([])
 
-    largest_cluster = max(set(clusters), key=list(clusters).count)
-    filtered_data = data[clusters == largest_cluster]
+    spatial_data = data[:, :3]
+    clusters = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(spatial_data)
 
-    print(f"Points retained: {len(filtered_data)}")
-    return filtered_data
+    if np.all(clusters == -1):
+        return np.array([])
 
-
-def user_mode():
-    mode = 0
-    file_index = 1
-    dir_path = ''
-    parent_dir = "./data/"
-    sensor_data = pd.DataFrame([], columns=["x", "y", "z", "Doppler"])
-    print("Select Mode: ")
-    while not mode or mode > 2:
-        mode = int(input("[1] - Gesture Classification  | [2] - Data Capture \n"))
-        print(mode)
-
-    if mode == 1:
-        print("[1] Gesture Classification Selected")
-        new_gesture_name = "placeholder"
-        dir_path = parent_dir
-
-    elif mode == 2:
-        print("[2] Data Capture Selected")
-        new_gesture_name = str(input("Name of gesture: "))
-        dir_path = os.path.join(parent_dir, new_gesture_name)
-
-        if not os.path.exists(dir_path):
-            os.mkdir(dir_path)
-            sensor_data.to_csv(f"data/{new_gesture_name}/{new_gesture_name}_{file_index}.csv", index=False)
-        else:
-            print("Gesture Already Exists, will create new dataset within gesture file")
-            while (os.path.exists(f"data/{new_gesture_name}/{new_gesture_name}_{file_index}.csv")):
-                file_index += 1
-
-            sensor_data.to_csv(f"data/{new_gesture_name}/{new_gesture_name}_{file_index}.csv", index=False)
-
-    return new_gesture_name, dir_path, mode, file_index
+    largest_cluster = np.bincount(clusters[clusters != -1]).argmax()
+    return data[clusters == largest_cluster]
 
 
-def configure_sensor():
-    sensor1 = IWR6843AOP("1", verbose=False)
-    file = load_cfg_file("/Users/chengju/Desktop/FYP/simpleCNN (2)/simpleCNN/mmwave_config/xwr68xx_AOP_config_10FPS_maxRange_30cm.cfg")
+async def process_sensor_stream(sens: Sensor, model: torch.nn.Module, device: torch.device, 
+                                mode: int, gesture_name: str, save_path: str):
+    """
+    异步处理传感器数据流 (替代原先的 print_data 函数)
+    mode 1: 实时推理控制
+    mode 2: 采集训练数据
+    """
+    frame_buffer = []  # 替代原命名有歧义的 train_data
+    original_points_history, filtered_points_history = [], []
+    labels_map = {0: "Clockwise", 1: "Counter Clockwise", 2: "Swipe", 3: "Swipe Up and Down"}
+    
+    print("\n[*] 传感器数据流已启动，等待雷达数据...")
+    await asyncio.sleep(1)
 
-    # Your CONFIG serial port name
-    config_connected = sensor1.connect_config('/dev/tty.SLAB_USBtoUART', 115200)
-    if not config_connected:
-        print("Config connection failed.")
-        exit()
-
-    # Your DATA serial port name
-    data_connected = sensor1.connect_data('/dev/tty.SLAB_USBtoUART4', 921600)
-    if not data_connected:
-        print("Data connection failed.")
-        exit()
-
-    if not sensor1.send_config(file, max_retries=1):
-        print("Sending configuration failed")
-        exit()
-
-    return sensor1
-
-
-def visualize_dbscan(original_data, filtered_data):
-    plt.clf()
-    fig = plt.figure(figsize=(15, 10))
-
-    # 设置坐标轴范围
-    axis_range = [-0.4, 0.4]
-    ticks = np.arange(-0.3, 0.31, 0.01)
-
-    # 创建3D图 - 原始数据
-    ax1 = fig.add_subplot(121, projection='3d')
-    scatter1 = ax1.scatter(original_data[:, 0],
-                           original_data[:, 1],
-                           original_data[:, 2],
-                           c=original_data[:, 3],  # 使用多普勒值作为颜色
-                           cmap='jet',  # 使用jet色图
-                           s=50)  # 点的大小
-
-    ax1.set_title(f'Original Data (Points: {len(original_data)})')
-    ax1.set_xlabel('X (m)')
-    ax1.set_ylabel('Y (m)')
-    ax1.set_zlabel('Z (m)')
-    ax1.set_xlim(axis_range)
-    ax1.set_ylim(axis_range)
-    ax1.set_zlim(axis_range)
-    fig.colorbar(scatter1, label='Doppler (m/s)')
-
-    # 创建3D图 - 过滤后数据
-    ax2 = fig.add_subplot(122, projection='3d')
-    scatter2 = ax2.scatter(filtered_data[:, 0],
-                           filtered_data[:, 1],
-                           filtered_data[:, 2],
-                           c=filtered_data[:, 3],  # 使用多普勒值作为颜色
-                           cmap='jet',  # 使用jet色图
-                           s=50)  # 点的大小
-
-    ax2.set_title(f'After DBSCAN (Points: {len(filtered_data)})')
-    ax2.set_xlabel('X (m)')
-    ax2.set_ylabel('Y (m)')
-    ax2.set_zlabel('Z (m)')
-    ax2.set_xlim(axis_range)
-    ax2.set_ylim(axis_range)
-    ax2.set_zlim(axis_range)
-    fig.colorbar(scatter2, label='Doppler (m/s)')
-
-    # 添加网格
-    ax1.grid(True)
-    ax2.grid(True)
-
-    # 设置视角
-    ax1.view_init(elev=20, azim=45)
-    ax2.view_init(elev=20, azim=45)
-
-    plt.tight_layout()
-    plt.draw()
-    plt.pause(0.01)
-
-
-async def print_data(sens: Sensor, gesture_name, directory, mode, index):
     try:
-        cache_flush = 0
-        train_data = []
-        original_points_history = []
-        filtered_points_history = []
-        encoded_labels = ["Clockwise", "Counter Clockwise", "Swipe", "Swipe Up and Down"]
-        label_mapping = {idx: label for idx, label in enumerate(encoded_labels)}
-        data_collection_complete = False
-        MIN_SAMPLES = 500
+        while sens.is_alive():
+            sensor_object_data = await sens.get_data()
+            incoming_data_array = sensor_object_data.get()
+            
+            if len(incoming_data_array) == 0:
+                continue
 
-        await asyncio.sleep(1)
-        while sens.is_alive() and not data_collection_complete:
-            try:
-                sensor_object_data = await sens.get_data()
-                incoming_data_array = sensor_object_data.get()
-                print("\n New scan!")
+            original_data = np.array(incoming_data_array)
+            filtered_data = apply_dbscan_filtering(incoming_data_array)
 
-                if cache_flush:
-                    incoming_data_array = []
-                    cache_flush = 0
-                    print("\n Cache flushed!")
+            if len(filtered_data) == 0:
+                continue
 
-                if len(incoming_data_array) > 0:
-                    original_data = np.array(incoming_data_array)
-                    filtered_data = apply_dbscan_filtering(incoming_data_array, eps=0.09, min_samples=2)
+            # 记录历史用于 3D 可视化
+            original_points_history.extend(original_data)
+            filtered_points_history.extend(filtered_data)
 
-                    if len(original_data) > 0:
-                        original_points_history.extend(original_data)
-                    if len(filtered_data) > 0:
-                        filtered_points_history.extend(filtered_data)
+            # 计算单帧均值特征并压入队列
+            frame_feature = np.mean(filtered_data, axis=0).reshape(1, 4).astype("float32")
+            frame_buffer.append(frame_feature)
 
-                    if len(filtered_data) > 0:
-                        average_of_data = np.mean(filtered_data, axis=0).reshape(1, 4).astype("float32")
-                        train_data.append(average_of_data)
+            # ----------------------------------------
+            # 模式 1: 实时推理与系统控制
+            # ----------------------------------------
+            if mode == 1 and len(frame_buffer) >= Config.SEQ_LENGTH:
+                # 构建时序窗口张量: (1, seq_len, features)
+                window_data = np.concatenate(frame_buffer[-Config.SEQ_LENGTH:], axis=0)
+                input_tensor = torch.from_numpy(window_data).reshape(1, Config.SEQ_LENGTH, 4).float().to(device)
 
-                    print("Points collected:", len(train_data))
+                with torch.no_grad():
+                    outputs = model(input_tensor)
+                    confidence, predicted = torch.max(torch.softmax(outputs, dim=1), 1)
+                    prediction_label = labels_map[predicted.item()]
+                    conf_score = confidence.item() * 100
 
-                    if mode == 1 and len(train_data) >= 3:
-                        try:
-                            live_test_data = np.concatenate(train_data, axis=0)
-                            n_samples = (len(live_test_data) // 3) * 3
-                            live_test_data = live_test_data[:n_samples]
-                            live_test_data = live_test_data.reshape(-1, 3, 4).astype("float32")
-                            print('\n Live test data shape: ', live_test_data.shape)
+                print(f"| 动作: {prediction_label:<20} | 置信度: {conf_score:.2f}% |")
 
-                            if len(original_points_history) > 0 and len(filtered_points_history) > 0:
-                                original_points = np.array(original_points_history)
-                                filtered_points = np.array(filtered_points_history)
-                                visualize_dbscan(original_points, filtered_points)
+                if conf_score > Config.CONFIDENCE_THRESHOLD:
+                    MacOSMediaController.execute_action(prediction_label)
+                    # 触发动作后清空缓存，设置冷却时间防误触
+                    frame_buffer.clear()
+                    original_points_history.clear()
+                    filtered_points_history.clear()
+                    await asyncio.sleep(1.5)  
+                else:
+                    # 队列滑动
+                    frame_buffer.pop(0)
 
-                            input_tensor = torch.from_numpy(live_test_data).float().to(device)
+            # ----------------------------------------
+            # 模式 2: 训练数据采集
+            # ----------------------------------------
+            elif mode == 2:
+                print(f"采集进度: {len(frame_buffer)}/{Config.MIN_CAPTURE_SAMPLES}", end="\r")
+                if len(frame_buffer) >= Config.MIN_CAPTURE_SAMPLES:
+                    data_to_store = np.vstack([arr.reshape(-1, 4) for arr in frame_buffer])
+                    df = pd.DataFrame(data_to_store, columns=["x", "y", "z", "Doppler"])
+                    df.to_csv(save_path, index=False)
+                    print(f"\n[+] 数据已保存至: {save_path}")
+                    break
 
-                            with torch.no_grad():
-                                outputs = model(input_tensor)
-                                _, predicted = torch.max(outputs.data, 1)
-                                prediction = label_mapping[predicted.item()]
-                                confidence = torch.softmax(outputs, dim=1).max().item() * 100
+            await asyncio.sleep(0.01) # 让出事件循环
 
-                            print(f"\nThe predicted gesture is: {prediction}, and the confidence is: {confidence}%")
-
-                            # 使用新的媒体控制方法
-                            if confidence > 70:
-                                if prediction in gesture_to_action:
-                                    action = gesture_to_action[prediction]
-                                    print(f"执行动作: {action}")
-                                    control_media(action)
-
-                            train_data = []
-                            original_points_history = []
-                            filtered_points_history = []
-                            cache_flush = 1
-                            await asyncio.sleep(2)
-
-                        except Exception as e:
-                            print(f"Error in classification mode: {e}")
-                            train_data = []
-
-                    elif mode == 2 and len(train_data) >= MIN_SAMPLES:
-                        try:
-                            if train_data:
-                                data_to_store = np.vstack([arr.reshape(-1, 4) for arr in train_data])
-                                gesture_data = pd.DataFrame(
-                                    data_to_store,
-                                    columns=["x", "y", "z", "Doppler"]
-                                )
-
-                                if len(original_points_history) > 0 and len(filtered_points_history) > 0:
-                                    original_points = np.array(original_points_history)
-                                    filtered_points = np.array(filtered_points_history)
-                                    visualize_dbscan(original_points, filtered_points)
-
-                                output_path = f"{directory}/{gesture_name}_{index}.csv"
-                                gesture_data.to_csv(output_path, mode='a', index=False, header=False)
-                                print(f"Saved {len(gesture_data)} samples to {output_path}")
-                                data_collection_complete = True
-
-                        except Exception as e:
-                            print(f"Error in data capture mode: {e}")
-                            print(f"Data shape before processing: {[arr.shape for arr in train_data]}")
-
-            except asyncio.CancelledError:
-                print("Data collection cancelled")
-                break
-            except Exception as e:
-                print(f"Error in data processing loop: {e}")
-                await asyncio.sleep(0.1)
-
+    except asyncio.CancelledError:
+        print("\n[*] 接收到中断信号，停止数据流...")
     except Exception as e:
-        print(f"Error in print_data: {e}")
-    finally:
-        print("Data collection completed")
-        data_collection_complete = True
+        print(f"[-] 数据流处理异常: {e}")
+
+
+# ==========================================
+# 3. 硬件交互与主入口
+# ==========================================
+def setup_hardware() -> Sensor:
+    """初始化并配置雷达硬件"""
+    sensor = IWR6843AOP("1", verbose=False)
+    
+    # 注意: 这里建议把配置文件放到项目相对路径下
+    if not os.path.exists(Config.CFG_FILE_PATH):
+        print(f"[-] 找不到配置文件: {Config.CFG_FILE_PATH}")
+        exit(1)
+        
+    file_cfg = load_cfg_file(Config.CFG_FILE_PATH)
+
+    if not sensor.connect_config(Config.CLI_PORT, 115200):
+        print("[-] 雷达 Config 端口连接失败。")
+        exit(1)
+
+    if not sensor.connect_data(Config.DATA_PORT, 921600):
+        print("[-] 雷达 Data 端口连接失败。")
+        exit(1)
+
+    if not sensor.send_config(file_cfg, max_retries=1):
+        print("[-] 下发雷达配置失败。")
+        exit(1)
+
+    print("[+] 毫米波雷达硬件初始化完成。")
+    return sensor
+
 
 def main():
-    gesture_name, directory, mode, index = user_mode()
-    sensor = configure_sensor()
+    print("=======================================")
+    print("   mmWave Gesture Control System       ")
+    print("=======================================")
+    
+    mode = 0
+    while mode not in [1, 2]:
+        try:
+            mode = int(input("[1] 实时手势控制  |  [2] 采集训练数据 \n请选择模式: "))
+        except ValueError:
+            pass
 
-    event_loop = get_event_loop()
-    event_loop.create_task(sensor.start_sensor())
-    event_loop.create_task(print_data(sensor, gesture_name, directory, mode, index))
-    event_loop.run_forever()
+    gesture_name = "inference_mode"
+    save_path = ""
+
+    if mode == 2:
+        gesture_name = input("请输入要采集的手势名称 (如 clockwise): ").strip()
+        target_dir = os.path.join(Config.DATA_DIR, gesture_name)
+        os.makedirs(target_dir, exist_ok=True)
+        
+        file_idx = 1
+        while os.path.exists(os.path.join(target_dir, f"{gesture_name}_{file_idx}.csv")):
+            file_idx += 1
+        save_path = os.path.join(target_dir, f"{gesture_name}_{file_idx}.csv")
+        print(f"[*] 数据将保存至: {save_path}")
+
+    # 1. 初始化硬件
+    sensor = setup_hardware()
+    
+    # 2. 初始化 AI 模型
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = load_inference_model(device) if mode == 1 else None
+
+    # 3. 启动异步事件循环
+    event_loop = asyncio.get_event_loop()
+    try:
+        event_loop.create_task(sensor.start_sensor())
+        event_loop.create_task(process_sensor_stream(sensor, model, device, mode, gesture_name, save_path))
+        event_loop.run_forever()
+    except KeyboardInterrupt:
+        print("\n[*] 检测到用户终止程序 (Ctrl+C)")
+    finally:
+        print("[*] 正在清理资源...")
+        sensor.stop_sensor() 
+        # 获取所有未完成的任务并取消
+        pending = asyncio.all_tasks(loop=event_loop)
+        for task in pending:
+            task.cancel()
+        event_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        event_loop.close()
+        print("[+] 系统已安全退出。")
 
 
 if __name__ == "__main__":
+    # 为了避免 Mac 上 Matplotlib 阻塞主线程的玄学问题，使用非阻塞模式
+    plt.ion() 
     main()
