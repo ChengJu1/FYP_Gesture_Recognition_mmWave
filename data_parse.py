@@ -150,11 +150,10 @@ def apply_dbscan_filtering(data: np.ndarray, eps: float = 0.09, min_samples: int
 async def process_sensor_stream(sens: Sensor, model: torch.nn.Module, device: torch.device, 
                                 mode: int, gesture_name: str, save_path: str):
     """
-    异步处理传感器数据流 (替代原先的 print_data 函数)
     mode 1: 实时推理控制
     mode 2: 采集训练数据
     """
-    frame_buffer = []  # 替代原命名有歧义的 train_data
+    frame_buffer = [] 
     original_points_history, filtered_points_history = [], []
     labels_map = {0: "Clockwise", 1: "Counter Clockwise", 2: "Swipe", 3: "Swipe Up and Down"}
     
@@ -236,8 +235,6 @@ async def process_sensor_stream(sens: Sensor, model: torch.nn.Module, device: to
 def setup_hardware() -> Sensor:
     """初始化并配置雷达硬件"""
     sensor = IWR6843AOP("1", verbose=False)
-    
-    # 注意: 这里建议把配置文件放到项目相对路径下
     if not os.path.exists(Config.CFG_FILE_PATH):
         print(f"[-] 找不到配置文件: {Config.CFG_FILE_PATH}")
         exit(1)
