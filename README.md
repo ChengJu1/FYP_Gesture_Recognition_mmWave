@@ -70,9 +70,6 @@ FYP_Gesture_Recognition_mmWave/
 ├── train.py               # 训练脚本（Adam + 交叉熵 + 早停，保存最优权重）
 ├── confusion matrix.py    # 混淆矩阵可视化评估
 ├── eval_resume_metrics.py # 准确率 / 数据集统计指标脚本
-├── eval_checkpoint_b00a7dc.py  # 针对历史 checkpoint 的评估脚本
-├── model_b00a7dc.py       # 历史版本模型 + 数据加载（旧接口）
-├── legacy_model.py        # 早期模型实现（保留备查）
 ├── best_model.pth         # 训练得到的最优模型权重
 ├── checkpoints/           # 训练过程 checkpoint
 ├── mmwave_config/         # 雷达配置文件 (.cfg)
@@ -176,8 +173,6 @@ python data_parse.py
 
 ## 已知问题与注意事项
 
-- **接口不一致**：`train.py` 从 `model` 导入 `GestureCNN, train_loader, test_loader`，而重构后的 `model.py` 提供的是 `GestureTransformer` 与 `prepare_data()`（无模块级 loader）。旧接口保留在 `legacy_model.py` / `model_b00a7dc.py` 中。训练前请确认导入来源一致（建议统一改用 `model.py` 的 `prepare_data()`）。
-- **历史文件**：`legacy_model.py`、`model_b00a7dc.py` 含有早期实现，部分中文注释为 GBK 编码、可能显示乱码，仅供备查。
-- **`test.py`**：引用了已不存在的 `SimpleCNN`，为历史遗留桩文件，可忽略。
 - **平台限制**：实时媒体控制依赖 macOS 的 AppleScript；在其他系统上需自行替换 `MacOSMediaController` 中的控制逻辑。
-- **硬编码路径**：部分评估脚本中的模型路径（如 `d:\Edge\best_model.pth`）为本地绝对路径，运行前请按需修改。
+- **模型类命名**：核心模型类在历史代码中曾命名为 `GestureCNN`，实际为 Transformer 编码器；当前统一使用 `model.py` 中的 `GestureTransformer`。
+- **27 维特征管线**：`data_processor.py` 的 `GestureDataProcessor` 为面向流式处理的进阶特征方案，当前训练 / 推理默认使用基础 4 维方案。
