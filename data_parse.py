@@ -11,7 +11,7 @@ from sklearn.cluster import DBSCAN
 from pymmWave.utils import load_cfg_file
 from pymmWave.sensor import Sensor
 from pymmWave.IWR6843AOP import IWR6843AOP
-from model import GestureCNN
+from model import GestureTransformer
 
 # ==========================================
 # 0. 全局配置项 (Configuration)
@@ -117,10 +117,10 @@ class MacOSMediaController:
 def load_inference_model(device: torch.device) -> torch.nn.Module:
     """加载 PyTorch 推理模型"""
     print(f"[*] 正在加载模型 (Device: {device})...")
-    model = GestureCNN()
+    model = GestureTransformer()
     try:
         checkpoint = torch.load(Config.MODEL_PATH, map_location=device, weights_only=False)
-        if isinstance(checkpoint, GestureCNN):
+        if isinstance(checkpoint, GestureTransformer):
             model.load_state_dict(checkpoint.state_dict())
         else:
             model.load_state_dict(checkpoint)

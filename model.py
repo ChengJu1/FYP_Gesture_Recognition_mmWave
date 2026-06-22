@@ -75,12 +75,17 @@ class GestureDataset(Dataset):
 
 
 def load_and_process_category(category_name: str, label_idx: int, num_files: int = 4, 
-                              sample_size: int = 3, target_cols: list = ["x", "y", "z", "Doppler"]):
+                              sample_size: int = 3, target_cols: list = ["x", "y", "z", "Doppler"],
+                              file_prefix: str = None):
     """
     通用数据加载与切片函数 (消除了原代码中的冗余复制粘贴)
+    file_prefix: 文件名前缀，默认与文件夹名一致；用于处理文件夹名与文件名不一致的情况
+                 (例如 counterclockwise 文件夹下的文件名为 counterwise_*.csv)
     """
+    if file_prefix is None:
+        file_prefix = category_name
     # 动态生成文件路径
-    file_paths = [f"data/{category_name}/{category_name}_{i}.csv" for i in range(1, num_files + 1)]
+    file_paths = [f"data/{category_name}/{file_prefix}_{i}.csv" for i in range(1, num_files + 1)]
     try:
         # 批量读取并合并
         df = pd.concat(map(pd.read_csv, file_paths), ignore_index=True)
@@ -102,20 +107,22 @@ def prepare_data(sample_size: int = 3, batch_size: int = 8):
     """
     构建数据加载器的入口工厂函数
     """
-    # 定义类别映射字典
+    # 定义类别映射字典: 文件夹名 -> (标签, 文件名前缀)
+    # counterclockwise 文件夹下的文件名实际为 counterwise_*.csv，因此单独指定前缀
     categories = {
-        "clockwise": 0,
-        "counterclockwise": 1,
-        "swipe": 2,
-        "up_down_swipe": 3
+        "clockwise": (0, "clockwise"),
+        "counterclockwise": (1, "counterwise"),
+        "swipe": (2, "swipe"),
+        "up_down_swipe": (3, "up_down_swipe"),
     }
     
     all_samples, all_labels = [], []
     
     # 遍历加载所有类别数据
-    for cat_name, label in categories.items():
-        # 注意: 如果 counterclockwise 的原文件名为 counterwise_*.csv，请在此处单独处理路径映射
-        samples, labels = load_and_process_category(cat_name, label, num_files=4, sample_size=sample_size)
+    for cat_name, (label, prefix) in categories.items():
+        samples, labels = load_and_process_category(
+            cat_name, label, num_files=4, sample_size=sample_size, file_prefix=prefix
+        )
         all_samples.extend(samples)
         all_labels.extend(labels)
 

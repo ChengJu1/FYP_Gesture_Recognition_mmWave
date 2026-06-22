@@ -7,16 +7,16 @@ from sklearn.model_selection import train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
-from model import GestureCNN
+from model import GestureTransformer
 from collections import OrderedDict
 
 
 plt.ion()
 print(torch.__version__)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = GestureCNN()  # 首先创建模型实例
+model = GestureTransformer()  # 首先创建模型实例
 checkpoint = torch.load('best_model.pth', map_location=device, weights_only=False)
-if isinstance(checkpoint, GestureCNN):
+if isinstance(checkpoint, GestureTransformer):
     # 如果保存的是整个模型，获取其状态字典
     model.load_state_dict(checkpoint.state_dict())
 else:
@@ -26,10 +26,10 @@ model.to(device)
 model.eval()
 
 # 数据加载和处理
-clockwise_train = pd.concat(map(pd.read_csv, ["data/clockwise/clockwise_1.csv.csv",
-                                              "data/clockwise/clockwise_2.csv.csv",
-                                              "data/clockwise/clockwise_3.csv.csv",
-                                              "data/clockwise/clockwise_4.csv.csv"]),
+clockwise_train = pd.concat(map(pd.read_csv, ["data/clockwise/clockwise_1.csv",
+                                              "data/clockwise/clockwise_2.csv",
+                                              "data/clockwise/clockwise_3.csv",
+                                              "data/clockwise/clockwise_4.csv"]),
                             ignore_index=True)
 counterclockwise_train = pd.concat(map(pd.read_csv, ["data/counterclockwise/counterwise_1.csv",
                                                      "data/counterclockwise/counterwise_2.csv",

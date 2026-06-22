@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
-from model import GestureCNN, train_loader, test_loader
+from model import GestureTransformer, prepare_data
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -85,7 +85,10 @@ if __name__ == "__main__":
     save_path = "best_model.pth"
     patience = 30  # 设置耐心值：连续30个epoch没有改善就早停
 
-    model = GestureCNN(num_classes=4).to(device)
+    # 构建数据加载器（统一使用 model.py 的数据管线）
+    train_loader, test_loader = prepare_data(sample_size=3, batch_size=8)
+
+    model = GestureTransformer(num_classes=4).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
 
